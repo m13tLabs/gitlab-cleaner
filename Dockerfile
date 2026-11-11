@@ -1,7 +1,7 @@
 # gitlab-cleaner: the `gitlab-cleaner` script plus a current `glab`, in a small Alpine image.
 #
 # glab comes from the official image instead of Alpine's package, which lags behind.
-FROM gitlab/glab:v1.128.0 AS glab
+FROM gitlab/glab:v1.130.0 AS glab
 
 FROM alpine:3.24
 
