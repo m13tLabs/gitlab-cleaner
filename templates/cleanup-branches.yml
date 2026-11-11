@@ -29,7 +29,7 @@ spec:
       default: m13t/gitlab-cleaner
       description: gitlab-cleaner container image, without the tag.
     version:
-      default: "0.0.0"  # x-release-version
+      default: "0.1.0"  # x-release-version
       description: gitlab-cleaner container image tag.
     job-name:
       default: cleanup-branches
