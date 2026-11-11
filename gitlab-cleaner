@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# gitlab-cleaner: delete stale branches in every GitLab project the token's user can access.
+#
+# Talks to the GitLab REST API through `glab api`, so authentication is whatever glab
+# uses: $GITLAB_TOKEN (+ $GITLAB_HOST for self-managed instances) or a `glab auth login`.
+# Every option can also be set via its CLEANER_* environment variable; flags win.
+set -euo pipefail
+
+VERSION="${GITLAB_CLEANER_VERSION:-dev}"
+
+INACTIVITY="${CLEANER_INACTIVITY:-90d}"
+DRY_RUN="${CLEANER_DRY_RUN:-true}"
+MIN_ACCESS_LEVEL="${CLEANER_MIN_ACCESS_LEVEL:-30}"
+SKIP_OPEN_MR="${CLEANER_SKIP_OPEN_MR:-true}"
+PROJECTS="${CLEANER_PROJECTS:-}"
+EXCLUDE_PROJECTS="${CLEANER_EXCLUDE_PROJECTS:-}"
+EXCLUDE_BRANCHES="${CLEANER_EXCLUDE_BRANCHES:-}"
+REPORT="${CLEANER_REPORT:-}"
+
+usage() {
+  cat <<EOF
+Usage: gitlab-cleaner [options]
+
+Deletes branches whose last commit is older than the inactivity period, in every
+non-archived project the authenticated user is a member of. Default, protected
+branches and (by default) branches with an open merge request are never touched.
+
+Runs in dry-run mode unless --dry-run=false (or --execute) is given.
+
+Options:
+  -i, --inactivity DURATION   Inactivity period: <n>[h|d|w|m|y], plain number = days
+                              (env CLEANER_INACTIVITY, default: 90d)
+  -n, --dry-run[=BOOL]        Only report what would be deleted
+                              (env CLEANER_DRY_RUN, default: true)
+  -x, --execute               Same as --dry-run=false
+      --min-access-level N    Minimum project access level to consider
+                              (10 guest .. 50 owner; env CLEANER_MIN_ACCESS_LEVEL, default: 30)
+      --include-open-mr       Also delete branches that are the source of an open MR
+                              (env CLEANER_SKIP_OPEN_MR=false; deleting closes the MR)
+  -p, --projects REGEX        Only projects whose full path matches (env CLEANER_PROJECTS)
+      --exclude-projects REGEX
+                              Skip projects whose full path matches (env CLEANER_EXCLUDE_PROJECTS)
+  -b, --exclude-branches REGEX
+                              Never delete matching branch names (env CLEANER_EXCLUDE_BRANCHES)
+  -r, --report FILE           Write a JSON report of all stale branches (env CLEANER_REPORT)
+  -V, --version               Print versions and exit
+  -h, --help                  Show this help
+
+Authentication: \$GITLAB_TOKEN (scope: api) and \$GITLAB_HOST, or an existing glab login.
+Inside GitLab CI, \$CI_SERVER_URL is used as host when \$GITLAB_HOST is unset.
+EOF
+}
+
+log() { printf '%s\n' "$*" >&2; }
+die() { log "error: $*"; exit 2; }
+
+is_bool() { [[ "$1" == "true" || "$1" == "false" ]]; }
+
+# Converts <n>[h|d|w|m|y] to seconds (m = 30 days, y = 365 days).
+duration_seconds() {
+  local value="$1" n unit
+  [[ "$value" =~ ^([0-9]+)([hdwmy]?)$ ]] || return 1
+  n=$((10#${BASH_REMATCH[1]}))
+  unit="${BASH_REMATCH[2]:-d}"
+  ((n > 0)) || return 1
+  case "$unit" in
+    h) echo $((n * 3600)) ;;
+    d) echo $((n * 86400)) ;;
+    w) echo $((n * 7 * 86400)) ;;
+    m) echo $((n * 30 * 86400)) ;;
+    y) echo $((n * 365 * 86400)) ;;
+  esac
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      -i | --inactivity) INACTIVITY="${2:?--inactivity needs a value}"; shift ;;
+      --inactivity=*) INACTIVITY="${1#*=}" ;;
+      -n | --dry-run) DRY_RUN=true ;;
+      --dry-run=*) DRY_RUN="${1#*=}" ;;
+      -x | --execute) DRY_RUN=false ;;
+      --min-access-level) MIN_ACCESS_LEVEL="${2:?--min-access-level needs a value}"; shift ;;
+      --min-access-level=*) MIN_ACCESS_LEVEL="${1#*=}" ;;
+      --include-open-mr) SKIP_OPEN_MR=false ;;
+      -p | --projects) PROJECTS="${2:?--projects needs a value}"; shift ;;
+      --projects=*) PROJECTS="${1#*=}" ;;
+      --exclude-projects) EXCLUDE_PROJECTS="${2:?--exclude-projects needs a value}"; shift ;;
+      --exclude-projects=*) EXCLUDE_PROJECTS="${1#*=}" ;;
+      -b | --exclude-branches) EXCLUDE_BRANCHES="${2:?--exclude-branches needs a value}"; shift ;;
+      --exclude-branches=*) EXCLUDE_BRANCHES="${1#*=}" ;;
+      -r | --report) REPORT="${2:?--report needs a value}"; shift ;;
+      --report=*) REPORT="${1#*=}" ;;
+      -V | --version)
+        echo "gitlab-cleaner ${VERSION}"
+        glab version 2>/dev/null || true
+        exit 0
+        ;;
+      -h | --help) usage; exit 0 ;;
+      *) usage >&2; die "unknown argument: $1" ;;
+    esac
+    shift
+  done
+
+  DRY_RUN="$(printf '%s' "$DRY_RUN" | tr '[:upper:]' '[:lower:]')"
+  SKIP_OPEN_MR="$(printf '%s' "$SKIP_OPEN_MR" | tr '[:upper:]' '[:lower:]')"
+  is_bool "$DRY_RUN" || die "dry-run must be true or false, got '$DRY_RUN'"
+  is_bool "$SKIP_OPEN_MR" || die "CLEANER_SKIP_OPEN_MR must be true or false, got '$SKIP_OPEN_MR'"
+  [[ "$MIN_ACCESS_LEVEL" =~ ^(10|15|20|30|40|50)$ ]] \
+    || die "min-access-level must be one of 10, 15, 20, 30, 40, 50, got '$MIN_ACCESS_LEVEL'"
+  INACTIVITY_SECONDS="$(duration_seconds "$INACTIVITY")" \
+    || die "invalid inactivity '$INACTIVITY' (expected e.g. 90, 90d, 12w, 6m, 1y)"
+
+  # Validate the regexes up front instead of failing on the first project/branch.
+  local re
+  for re in "$PROJECTS" "$EXCLUDE_PROJECTS" "$EXCLUDE_BRANCHES"; do
+    [[ -z "$re" ]] || jq -en --arg re "$re" '"" | test($re) | not or true' >/dev/null 2>&1 \
+      || die "invalid regular expression: $re"
+  done
+}
+
+# GitLab timestamps look like 2024-01-31T10:00:00.000+01:00; jq's fromdateiso8601 only
+# takes whole-second UTC, so strip the fraction and apply the offset by hand.
+JQ_EPOCH='
+def epoch:
+  capture("^(?<dt>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\\.[0-9]+)?(?<tz>Z|[+-][0-9]{2}:?[0-9]{2})?$")
+  | (.dt + "Z" | fromdateiso8601)
+    - (if (.tz // "Z") == "Z" then 0
+       else (.tz | capture("(?<s>[+-])(?<h>[0-9]{2}):?(?<m>[0-9]{2})")
+             | ((.h | tonumber) * 3600 + (.m | tonumber) * 60) * (if .s == "-" then -1 else 1 end))
+       end);
+'
+
+uri() { jq -rn --arg s "$1" '$s | @uri'; }
+
+main() {
+  parse_args "$@"
+
+  if [[ -z "${GITLAB_HOST:-}" && -n "${CI_SERVER_URL:-}" ]]; then
+    export GITLAB_HOST="$CI_SERVER_URL"
+  fi
+
+  local user
+  user="$(glab api user | jq -r '.username')" \
+    || die "cannot query the GitLab API - set GITLAB_TOKEN (scope: api) and GITLAB_HOST"
+
+  local now cutoff
+  now="$(date +%s)"
+  cutoff=$((now - INACTIVITY_SECONDS))
+
+  log "gitlab-cleaner ${VERSION} on ${GITLAB_HOST:-$(glab config get host 2>/dev/null || echo gitlab.com)} as @${user}"
+  log "inactivity: ${INACTIVITY} (last commit before $(jq -rn --argjson t "$cutoff" '$t | todate'))"
+  log "dry-run: ${DRY_RUN}, skip branches with open MRs: ${SKIP_OPEN_MR}, min access level: ${MIN_ACCESS_LEVEL}"
+  [[ "$DRY_RUN" == "true" ]] && log "DRY RUN - nothing will be deleted"
+  log ""
+
+  # Globals, so the EXIT trap still sees them after main returns.
+  results="$(mktemp)"
+  errfile="$(mktemp)"
+  trap 'rm -f "$results" "$errfile"' EXIT
+
+  local projects_seen=0 project_errors=0
+  local project id path branches open_mrs stale branch name date author enc status
+
+  # fd 3 keeps glab from ever reading the project list off stdin.
+  while IFS= read -r project <&3; do
+    id="$(jq -r '.id' <<<"$project")"
+    path="$(jq -r '.path' <<<"$project")"
+
+    if [[ -n "$PROJECTS" ]] && ! jq -en --arg p "$path" --arg re "$PROJECTS" '$p | test($re)' >/dev/null; then
+      continue
+    fi
+    if [[ -n "$EXCLUDE_PROJECTS" ]] && jq -en --arg p "$path" --arg re "$EXCLUDE_PROJECTS" '$p | test($re)' >/dev/null; then
+      continue
+    fi
+    projects_seen=$((projects_seen + 1))
+
+    if ! branches="$(glab api --paginate "projects/${id}/repository/branches?per_page=100" 2>"$errfile")"; then
+      log "WARN  ${path}: cannot list branches, skipping project: $(tail -n 1 "$errfile")"
+      project_errors=$((project_errors + 1))
+      continue
+    fi
+
+    stale="$(jq -c --argjson cutoff "$cutoff" --arg exclude "$EXCLUDE_BRANCHES" \
+      "${JQ_EPOCH}"'
+      .[]
+      | select((.default | not) and (.protected | not))
+      | select($exclude == "" or (.name | test($exclude) | not))
+      | {name, date: .commit.committed_date, author: .commit.author_name, merged,
+         ts: (.commit.committed_date | epoch)}
+      | select(.ts < $cutoff)' <<<"$branches")"
+
+    [[ -n "$stale" ]] || continue
+
+    # Only projects with stale candidates need the (extra) merge request lookup.
+    if [[ "$SKIP_OPEN_MR" == "true" ]]; then
+      if ! open_mrs="$(glab api --paginate "projects/${id}/merge_requests?state=opened&per_page=100" 2>"$errfile" \
+        | jq -sc --argjson id "$id" '[.[][] | select(.source_project_id == $id) | .source_branch] | unique')"; then
+        # Without the MR list we can't tell which branches are safe, so skip the project.
+        log "WARN  ${path}: cannot list open merge requests, skipping project: $(tail -n 1 "$errfile")"
+        project_errors=$((project_errors + 1))
+        continue
+      fi
+      stale="$(jq -c --argjson mrs "$open_mrs" 'select(.name | IN($mrs[]) | not)' <<<"$stale")"
+      [[ -n "$stale" ]] || continue
+    fi
+
+    while IFS= read -r branch; do
+      name="$(jq -r '.name' <<<"$branch")"
+      date="$(jq -r '.date' <<<"$branch")"
+      author="$(jq -r '.author' <<<"$branch")"
+      if [[ "$DRY_RUN" == "true" ]]; then
+        status="would-delete"
+      else
+        enc="$(uri "$name")"
+        if glab api -X DELETE "projects/${id}/repository/branches/${enc}" >/dev/null 2>&1 </dev/null; then
+          status="deleted"
+        else
+          status="failed"
+        fi
+      fi
+      printf '%-12s %s  %s  (last commit %s by %s)\n' "$status" "$path" "$name" "$date" "$author"
+      jq -c --arg project "$path" --argjson project_id "$id" --arg status "$status" \
+        '{project: $project, project_id: $project_id, branch: .name, last_commit: .date,
+          author, merged, status: $status}' <<<"$branch" >>"$results"
+    done <<<"$stale"
+  done 3< <(glab api --paginate \
+    "projects?membership=true&archived=false&min_access_level=${MIN_ACCESS_LEVEL}&simple=true&order_by=id&sort=asc&per_page=100" \
+    | jq -c '.[] | {id, path: .path_with_namespace}')
+
+  local summary
+  summary="$(jq -sc --arg user "$user" --arg inactivity "$INACTIVITY" --argjson dry_run "$DRY_RUN" \
+    --argjson projects "$projects_seen" --argjson project_errors "$project_errors" \
+    '{user: $user, inactivity: $inactivity, dry_run: $dry_run, projects: $projects,
+      project_errors: $project_errors,
+      would_delete: map(select(.status == "would-delete")) | length,
+      deleted: map(select(.status == "deleted")) | length,
+      failed: map(select(.status == "failed")) | length,
+      branches: .}' "$results")"
+
+  if [[ -n "$REPORT" ]]; then
+    jq '.' <<<"$summary" >"$REPORT"
+    log ""
+    log "report written to ${REPORT}"
+  fi
+
+  log ""
+  jq -r '"projects scanned: \(.projects) (\(.project_errors) skipped with errors), "
+         + if .dry_run then "stale branches: \(.would_delete)"
+           else "deleted: \(.deleted), failed: \(.failed)" end' <<<"$summary" >&2
+
+  [[ "$(jq '.failed' <<<"$summary")" == "0" ]] || exit 1
+}
+
+main "$@"

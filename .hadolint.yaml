@@ -1,0 +1,4 @@
+ignored:
+  # bash/jq/ca-certificates follow the Alpine release of the base image; pinning
+  # their versions only breaks the build on every Alpine point release.
+  - DL3018

@@ -1,0 +1,4 @@
+RELEASE_NOTES.md
+*.log
+gitlab-cleaner-report.json
+.DS_Store

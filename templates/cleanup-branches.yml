@@ -1,0 +1,77 @@
+spec:
+  description: >-
+    Deletes stale branches in all projects the $GITLAB_TOKEN user can access (Developer+).
+    Default, protected and open-MR branches are kept. Runs on schedules and manual pipelines.
+  inputs:
+    inactivity:
+      default: 90d
+      regex: ^[1-9][0-9]*[hdwmy]?$
+      description: >-
+        Delete branches whose last commit is older than this: `<n>` plus an optional unit
+        `h`, `d` (default), `w`, `m` (30 days) or `y` (365 days), e.g. `90d`, `12w`, `6m`.
+    dry-run:
+      type: boolean
+      default: true
+      description: >-
+        Only report the stale branches (job log + `gitlab-cleaner-report.json` artifact),
+        delete nothing. A manual run can override it with the pipeline variable
+        `CLEANER_DRY_RUN=false`.
+    exclude:
+      default: ""
+      description: >-
+        Optional regular expression (jq/Oniguruma syntax) of branch names that are never
+        deleted, e.g. `^(release|hotfix)/`. Empty excludes nothing beyond the default,
+        protected and open-MR branches.
+    stage:
+      default: test
+      description: Pipeline stage the job runs in.
+    image:
+      default: m13t/gitlab-cleaner
+      description: gitlab-cleaner container image, without the tag.
+    version:
+      default: "0.0.0"  # x-release-version
+      description: gitlab-cleaner container image tag.
+    job-name:
+      default: cleanup-branches
+      description: Name of the generated job.
+    rules:
+      type: array
+      default:
+        - if: $CI_PIPELINE_SOURCE == "schedule"
+        - if: $CI_PIPELINE_SOURCE == "web"
+      description: >-
+        Job `rules`. The default runs the job in scheduled pipelines and in pipelines started
+        with "Run pipeline" only.
+
+---
+
+"$[[ inputs.job-name ]]":
+  stage: $[[ inputs.stage ]]
+  image:
+    name: "$[[ inputs.image ]]:$[[ inputs.version ]]"
+    entrypoint: [""]
+  rules: $[[ inputs.rules ]]
+  # Two overlapping runs would race on the same branches.
+  resource_group: gitlab-cleaner
+  variables:
+    GIT_STRATEGY: none
+    CLEANER_INACTIVITY: "$[[ inputs.inactivity ]]"
+    CLEANER_DRY_RUN: "$[[ inputs.dry-run ]]"
+    # No variable expansion: a regex like `fix$|^tmp` must reach the script verbatim.
+    CLEANER_EXCLUDE_BRANCHES:
+      value: "$[[ inputs.exclude ]]"
+      expand: false
+    CLEANER_REPORT: gitlab-cleaner-report.json
+  script:
+    - |
+      if [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo "GITLAB_TOKEN is not set: add a masked CI/CD variable holding a personal, group or"
+        echo "project access token with the 'api' scope. Its user's projects are cleaned up."
+        exit 1
+      fi
+    - gitlab-cleaner
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - gitlab-cleaner-report.json
